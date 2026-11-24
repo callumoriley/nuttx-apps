@@ -53,7 +53,7 @@
  ****************************************************************************/
 
 static FAR void *doit(pthread_addr_t pvarg);
-static int getstr(int fd, FAR char *buf);
+static int getstr(int fd, FAR char *buf, size_t size);
 
 /****************************************************************************
  * Private Data
@@ -63,24 +63,32 @@ static int getstr(int fd, FAR char *buf);
  * Private Functions
  ****************************************************************************/
 
-static int getstr(int fd, FAR char *buf)
+/* Read a NUL-terminated string of at most 'size' bytes, NUL included.
+ * Returns its length with the NUL (> 0), or <= 0 if the peer closed, the
+ * read failed or the string does not fit.
+ */
+
+static int getstr(int fd, FAR char *buf, size_t size)
 {
-  FAR char *end = buf;
+  size_t len = 0;
   int ret;
 
   do
     {
-      ret = read(fd, end, 1);
+      if (len >= size)
+        {
+          return -1;
+        }
+
+      ret = read(fd, &buf[len], 1);
       if (ret <= 0)
         {
           return ret;
         }
-
-      end += ret;
     }
-  while (*(end - 1));
+  while (buf[len++] != '\0');
 
-  return ret;
+  return len;
 }
 
 static FAR void *doit(pthread_addr_t pvarg)
@@ -90,16 +98,20 @@ static FAR void *doit(pthread_addr_t pvarg)
   pid_t pid;
   int sock = (long)pvarg;
   int ret;
+  int i;
 
-  /* we need to read err_sock, user and passwd, but ignore them */
+  /* Read err_sock, user and passwd, which are ignored, and then the
+   * command.  Drop the connection if the peer closes before sending all
+   * four, as buf would not hold a command.
+   */
 
-  getstr(sock, buf);
-  getstr(sock, buf);
-  getstr(sock, buf);
-
-  /* we need to read command */
-
-  getstr(sock, buf);
+  for (i = 0; i < 4; i++)
+    {
+      if (getstr(sock, buf, sizeof(buf)) <= 0)
+        {
+          goto errout;
+        }
+    }
 
   memset(fds, 0, sizeof(fds));
   fds[0].events = POLLIN;
@@ -277,7 +289,11 @@ int main(int argc, FAR char **argv)
       sock = accept4(serv, NULL, 0, SOCK_CLOEXEC);
       if (sock < 0)
         {
-          if (errno == EINTR)
+          /* A peer that closed before it was accepted fails only its own
+           * connection, so keep serving the others.
+           */
+
+          if (errno == EINTR || errno == ECONNABORTED || errno == ENOTCONN)
             {
               continue;
             }
